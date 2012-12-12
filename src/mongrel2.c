@@ -145,7 +145,7 @@ Server *load_server(const char *db_file, const char *server_uuid, Server *old_sr
 
     srv = Config_load_server(server_uuid);
     check(srv, "Failed to load server %s from %s", server_uuid, db_file);
-    check(srv->default_host, "No default_host set for server: %s, you need one host named: %s", server_uuid, bdata(srv->default_hostname));
+    //check(srv->default_host, "No default_host set for server: %s, you need one host named: %s", server_uuid, bdata(srv->default_hostname));
 
     if(old_srv == NULL || old_srv->listen_fd == -1) {
         srv->listen_fd = netannounce(TCP, bdata(srv->bind_addr), srv->port);
