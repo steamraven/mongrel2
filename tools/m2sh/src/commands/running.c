@@ -33,6 +33,10 @@
  */
 
 #include <signal.h>
+#include <unistd.h>
+#include <stdio.h>
+#include <sys/wait.h>
+#include <fcntl.h>
 
 #include <zmq.h>
 
@@ -58,6 +62,102 @@ struct ServerRun {
     const char *sudo;
     int murder;
 };
+
+typedef struct child_t {
+    int id;
+    lnode_t *node;
+    FILE *stream;
+    pid_t pid;
+    bstring uuid;
+} child_t;
+
+volatile sig_atomic_t termination_in_progress = 0;
+volatile list_t *termination_child_list = NULL;
+//FROM: http://www.gnu.org/software/libc/manual/
+void
+termination_handler (int sig)
+{
+    /* Since this handler is established for more than one kind of signal,
+      it might still get invoked recursively by delivery of some other kind
+      of signal.  Use a static variable to keep track of that. */
+    if (termination_in_progress)
+        raise (sig);
+    termination_in_progress = 1;
+    log_info("Caught signal. Terminating...");
+    if (termination_child_list) {
+        child_t *child;
+        lnode_t *node;
+        for (node = list_first(termination_child_list);
+             node != NULL;
+             node = list_next(termination_child_list,node))
+        {
+            child = (child_t *) lnode_get(node);
+            if (child) {
+                log_info("UUID %s: Killing...", bdata(child->uuid));
+                kill(child->pid, sig);
+            }
+        }
+    }
+
+    /* Now reraise the signal.  We reactivate the signal's
+      default handling, which is to terminate the process.
+      We could just call exit or abort,
+      but reraising the signal sets the return status
+      from the process correctly. */
+    signal (sig, SIG_DFL);
+    raise (sig);
+}
+
+//FROM: http://www.gnu.org/software/libc/manual/
+static int install_signal_handler(list_t *child_list) {
+    termination_child_list = child_list;
+    if (signal (SIGINT, termination_handler) == SIG_IGN)
+      signal (SIGINT, SIG_IGN);
+    if (signal (SIGHUP, termination_handler) == SIG_IGN)
+      signal (SIGHUP, SIG_IGN);
+    if (signal (SIGTERM, termination_handler) == SIG_IGN)
+      signal (SIGTERM, SIG_IGN);
+    if (signal (SIGQUIT, termination_handler) == SIG_IGN)
+      signal (SIGQUIT, SIG_IGN);
+    return 0;
+}
+
+static int uninstall_signal_handler() {
+    termination_child_list = NULL;
+    if (signal (SIGINT, SIG_DFL) == SIG_IGN)
+      signal (SIGINT, SIG_IGN);
+    if (signal (SIGHUP, SIG_DFL) == SIG_IGN)
+      signal (SIGHUP, SIG_IGN);
+    if (signal (SIGTERM, SIG_DFL) == SIG_IGN)
+      signal (SIGTERM, SIG_IGN);
+    if (signal (SIGQUIT, SIG_DFL) == SIG_IGN)
+      signal (SIGQUIT, SIG_IGN);
+    return 0;
+}
+
+static int block_signals() {
+    sigset_t block_term;
+
+    sigemptyset (&block_term);
+    sigaddset (&block_term, SIGINT);
+    sigaddset (&block_term, SIGHUP);
+    sigaddset (&block_term, SIGTERM);
+    sigaddset (&block_term, SIGQUIT);
+    sigprocmask (SIG_BLOCK, &block_term, NULL);
+    return 0;
+}
+
+static int unblock_signals() {
+    sigset_t block_term;
+
+    sigemptyset (&block_term);
+    sigaddset (&block_term, SIGINT);
+    sigaddset (&block_term, SIGHUP);
+    sigaddset (&block_term, SIGTERM);
+    sigaddset (&block_term, SIGQUIT);
+    sigprocmask (SIG_UNBLOCK, &block_term, NULL);
+    return 0;
+}
 
 static inline int exec_server_operations(Command *cmd,
         int (*callback)(struct ServerRun *, tns_value_t *), const char *select)
@@ -93,8 +193,8 @@ static inline int exec_server_operations(Command *cmd,
     bstring every = option(cmd, "every", NULL);
     run.murder = option(cmd, "murder", NULL) != NULL;
 
-    int option_count = (every != NULL) + (name != NULL) + (host != NULL) + (uuid != NULL);
-    check(option_count == 1, "Just one please, not all of the options.");
+    int option_count =  (name != NULL) + (host != NULL) + (uuid != NULL);
+    check(option_count <= 1, "Just one please, not all of the options.");
 
     if(sudo) {
         run.sudo = biseqcstr(sudo, "") ? "sudo" : bdata(sudo);
@@ -106,21 +206,21 @@ static inline int exec_server_operations(Command *cmd,
         rc = DB_init(bdata(db_file));
         check(rc == 0, "Failed to open db: %s", bdata(db_file));
 
-        if(every) {
-            res = DB_exec("SELECT %s FROM server", select);
-        } else if(name) {
+        if(name) {
             res = DB_exec("SELECT %s FROM server where name = %Q", select, bdata(name));
         } else if(host) {
             res = DB_exec("SELECT %s FROM server where default_host = %Q", select, bdata(host));
         } else if(uuid) {
             res = DB_exec("SELECT %s FROM server where uuid = %Q", select, bdata(uuid));
+            check(darray_end(res->value.list) == 1, "Cannot have more than one server with the same uuid %s", bdata(uuid));
         } else {
-            sentinel("You must give either -name, -uuid, or -host to start a server.");
+            res = DB_exec("SELECT %s FROM server", select);
         }
-
+        debug("Found %d servers", darray_end(res->value.list));
         check(tns_get_type(res) == tns_tag_list,
                 "Wrong return type from query, should be list.");
         check(darray_end(res->value.list) > 0, "No servers matched the description.");
+        check(darray_end(res->value.list) == 1 || every, "Found multiple servers. Please use '-every' option to specify all of them");
     }
 
     check(callback(&run, res) != -1, "Failed to run internal operation.");
@@ -153,41 +253,343 @@ error:
     return -1;
 }
 
+void destroy_child(child_t *child)
+{
+    if  (child->pid) {
+        log_info("UUID %s: Killing due to error", child->uuid);
+        kill(child->pid, SIGTERM);
+    }
+    if (child->stream) {
+        fclose(child->stream);
+    }
+    if (child->uuid) {
+        bdestroy(child->uuid);
+        child->uuid = NULL;
+    }
+    free (child);
+
+}
+
+//FROM: http://www.gnu.org/software/libc/manual/
+int set_nonblock_flag(int fd, int value)
+{
+    int oldflags = fcntl (fd, F_GETFL, 0);
+    /* If reading the flags failed, return error indication now. */
+    if (oldflags == -1)
+     return -1;
+    /* Set just the flag we want to set. */
+    if (value != 0)
+       oldflags |= O_NONBLOCK;
+    else
+       oldflags &= ~O_NONBLOCK;
+    /* Store modified flag word in the descriptor. */
+    return fcntl (fd, F_SETFL, oldflags);
+}
+
+/* Returns:
+  -1: error
+   0: child_deleted
+   1: all good
+*/
+static int process_child_data(list_t *child_list, child_t * child)
+{
+    //TODO: Little more errorchecking
+    static int last_id=-1;
+    int status;
+    int result;
+    char *line = NULL;
+    size_t line_size = 0;
+    int new_line = 1;
+    debug("UUID %s: processing data", bdata(child->uuid));
+    set_nonblock_flag(fileno(child->stream),1);
+    while (1) {
+        if (line)
+            free(line);
+        line = NULL;
+        line_size = 0;
+        result = getline(&line, &line_size, child->stream);
+        if (result > 0) {
+            if (child->id != last_id) {
+                last_id = child->id;
+                fprintf(dbg_get_log(), "(%d) UUID: %s\n", child->id, bdata(child->uuid));
+            }
+            if (new_line) {
+                fprintf(dbg_get_log(), "    (%d) %s", child->id, line);
+            } else {
+                fprintf(dbg_get_log(), "%s", line);
+            }
+            new_line = (line[result-1] == '\n');
+        }
+        if (result == 0)
+            break;
+        if (ferror(child->stream) && errno == EAGAIN) {
+            // no more data available. Clear Error (very important)
+            clearerr(child->stream);
+            errno=0;
+            debug("UUID %s: getline EAGAIN", bdata(child->uuid));
+
+            break;
+        }
+        if (feof(child->stream) || ferror(child->stream)) {
+            // child dead
+            result = waitpid(child->pid, &status, WNOHANG);
+            if (!(result == 0 || (result == -1 && errno == ECHILD)) ) {
+                log_err("UUID %s: Child stream died but not child. Killing.", bdata(child->uuid));
+                kill(child->pid, SIGTERM);
+            }
+            if (WIFEXITED(status)) {
+                log_info("UUID %s: Exited with status: %d", bdata(child->uuid), WEXITSTATUS(status));
+            } else {
+                log_info("UUID %s: Exited abnormally", bdata(child->uuid));
+            }
+            block_signals();
+            list_delete(child_list, child->node);
+            unblock_signals();
+            lnode_destroy(child->node);
+            child->node = NULL;
+            child->pid = (pid_t) 0;
+            destroy_child(child);
+            child = NULL;
+            errno=0;
+            return 0;
+        }
+    }
+    if (line)
+        free(line);
+
+
+    set_nonblock_flag(fileno(child->stream),0);
+    
+    if (!new_line) {
+        fprintf(dbg_get_log(), " \\\n");
+    }
+    return 1;
+
+error:
+    return -1;
+
+}
+
+static int process_children_data(list_t *child_list)
+{
+    //TODO: error checking
+    fd_set child_set;
+    lnode_t *node;
+    child_t *child;
+    int result;
+    int file_no;
+
+    FD_ZERO(&child_set);
+
+    for (node = list_first(child_list); node != NULL; node = list_next(child_list, node)) {
+        child = (child_t *) lnode_get(node);
+        file_no = fileno(child->stream);
+        FD_SET( file_no,&child_set);
+    }
+
+    // continue while there are streams to read from
+    debug("Starting children processing");
+    while (!list_isempty(child_list)) {
+        fd_set rd_set,ex_set;
+        memcpy(&rd_set, &child_set, sizeof(fd_set));
+        memcpy(&ex_set, &child_set, sizeof(fd_set));
+        debug("Blocking select %d", child_set);
+        result = select(FD_SETSIZE, &rd_set, NULL, &ex_set, NULL);
+        check(result != -1, "select failed");
+        debug("Select returned %d", result);
+        for (node = list_first(child_list); node != NULL; node = list_next(child_list, node)) {
+            child = (child_t *) lnode_get(node);
+            file_no = fileno(child->stream);
+            if (FD_ISSET(file_no, &rd_set) || FD_ISSET(file_no, &ex_set)) {
+                result = process_child_data(child_list, child);
+                if (result == 0) {
+                    //child died. Clear stream
+                    FD_CLR(file_no, &child_set);
+                    break;
+                }
+            }
+        }
+
+    }
+    return 0;
+
+error:
+    return 1;
+}
+
+
+int run_mongrel2(struct ServerRun *r, const_bstring config, const_bstring uuid, const_bstring module)
+{
+    bstring command = bformat("%s mongrel2 %s %s %s",
+            r->sudo, bdata(config), bdata(uuid), bdata(module));
+    debug("Running mongrel: %s", bdata(command));
+    system(bdata(command));
+    bdestroy(command);
+    return 1;
+}
+
+
+
+
+child_t * start_child_server(list_t *child_list, struct ServerRun *r,
+                             const_bstring config,
+                             const_bstring uuid,
+                             const_bstring module)
+{
+    int child_pipe[2] = {0,0};
+    child_t *child = NULL;
+    lnode_t *child_node = NULL;
+
+    child = calloc( 1,sizeof(child_t));
+    check_mem(child);
+    child_node = lnode_create(child);
+    check_mem(child_node);
+    child->node = child_node;
+    child->uuid = bstrcpy(uuid);
+    child->id = list_count(child_list);
+    check_mem(child->uuid);
+
+    check(pipe(child_pipe) == 0, "UUID %s: Failed to create child pipe", bdata(uuid));
+    //check(set_nonblock_flag(child_pipe[0],0) != -1, "UUID %s: Failed to unset nonblocking on child pipe", bdata(uuid));
+    child->stream = fdopen(child_pipe[0], "r");
+    setvbuf(child->stream, NULL, _IONBF,0);
+    check(child->stream != NULL, "UUID %s: Failed to create child stream", bdata(uuid));
+    child_pipe[0] = 0; // use child->stream instead
+
+    block_signals();
+    {
+        pid_t child_pid = fork();
+        check(child_pid != (pid_t) -1, "UUID %s: Failed to fork child");
+        if (child_pid == (pid_t) 0) {
+            //in child
+            uninstall_signal_handler();
+            unblock_signals();
+
+            fclose(child->stream);
+            dup2(child_pipe[1], STDERR_FILENO);
+
+            exit(run_mongrel2(r, config, child->uuid, module));
+        }
+        // in parent
+        child->pid = child_pid;
+        list_append(child_list, child_node);
+    }
+    unblock_signals();
+
+    close(child_pipe[1]);
+    child_pipe[1] = 0;
+    return child;
+error:
+
+    if (child && child->pid != (pid_t) 0) {
+        block_signals();
+        list_delete(child_list, child->node);
+    }
+    if (child)
+        destroy_child(child);
+
+    unblock_signals();
+    if (child_pipe[0]) {
+        close(child_pipe[0]);
+    }
+    if (child_pipe[1]) {
+        close(child_pipe[1]);
+    }
+    if (child_node) {
+        lnode_destroy(child_node);
+    }
+    return NULL;
+}
+
+
+
 static int run_server(struct ServerRun *r, tns_value_t *res)
 {
     r->ran = 0;
     bstring config = NULL;
     bstring module = NULL;
     bstring uuid = NULL;
+    int rows = 1;
+    list_t child_list;
 
     if(r->db_file) {
         DB_check(res, 0, 1, tns_tag_string);
         tns_value_t *uuid_val = DB_get(res, 0, 0);
-
         config = bstrcpy(r->db_file);
         module = bfromcstr("");
         uuid = bstrcpy(uuid_val->value.string);
+        rows = darray_end(res->value.list);
     } else {
         config = bstrcpy(r->config_url);
         module = bstrcpy(r->config_style);
         uuid = bstrcpy(r->uuid);
+        rows = 1;
     }
 
-    bstring command = bformat("%s mongrel2 %s %s %s",
-            r->sudo, bdata(config), bdata(uuid), bdata(module));
+    if (rows > 1) {
+        child_t * child;
+        int row;
 
-    system(bdata(command));
+        list_init(&child_list, LISTCOUNT_T_MAX);
+        check(install_signal_handler(&child_list) == 0, "Cannot create signal handler");
 
-    bdestroy(command);
+        for (row = 0; row < rows; row++) {
+            tns_value_t *uuid_val = DB_get(res, row, 0);
+            bdestroy(uuid);
+            uuid = bstrcpy(uuid_val->value.string);
+            debug("Starting server %d (UUID %s)", row, bdata(uuid));
+            child = start_child_server(&child_list, r, config, uuid, module);
+            if (child == NULL) {
+                log_err("UUID %s: Error creating child server", bdata(uuid));
+                errno = 0;
+                continue;
+            }
+            sleep(1);
+            check(process_child_data(&child_list, child) != -1, "UUID %s: Error processing child data.", bdata(uuid));
+
+        }
+
+        check(process_children_data(&child_list) ==0, "Error processing children data");
+        uninstall_signal_handler();
+        assert(list_isempty(&child_list));
+        r->ran = 1;
+    } else {
+        r->ran = run_mongrel2(r, config, uuid, module);
+    }
+
     bdestroy(config);
     bdestroy(module);
+    bdestroy(uuid);
 
-    r->ran = 1;
     return 0;
 
 error:
+    bdestroy(config);
+    bdestroy(module);
+    bdestroy(uuid);
+
+    if (rows > 1) {
+        lnode_t *node;
+        for (node = list_first(&child_list); node != NULL; node = list_next(&child_list, node)) {
+            child_t *child = (child_t *) lnode_get(node);
+            if (child) {
+                block_signals();
+                lnode_put(node, NULL);
+                destroy_child(child);
+                unblock_signals();
+            }
+        }
+        block_signals();
+        list_destroy_nodes(&child_list);
+        uninstall_signal_handler();
+        unblock_signals();
+
+    }
     return -1;
 }
+
+
+
 
 int Command_start(Command *cmd)
 {
