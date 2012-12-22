@@ -526,7 +526,8 @@ tns_value_t *config_load_server(const char *uuid)
     debug("Loading server");
 
     bson_init(query);
-    bson_append_string(query, "uuid", uuid);
+    if (uuid && strlen(uuid) > 0)
+        bson_append_string(query, "uuid", uuid);
     bson_finish(query);
     
     bson_init(fields);
@@ -540,6 +541,7 @@ tns_value_t *config_load_server(const char *uuid)
     bson_append_int(fields, "error_log", 1);
     bson_append_int(fields, "pid_file", 1);
     bson_append_int(fields, "use_ssl", 1);
+    bson_append_int(fields, "name", 1);
     bson_finish(fields);
 
     bstring collection = bfromcstr("server");

@@ -38,6 +38,8 @@
 
 #include <tnetstrings.h>
 #include <tnetstrings_impl.h>
+#include <config/config.h>
+#include <config/module.h>
 #include <config/db.h>
 #include <handler.h>
 #include <pattern.h>
@@ -58,6 +60,25 @@ struct ServerRun {
     const char *sudo;
     int murder;
 };
+
+tns_value_t *tns_filter_str_field(tns_value_t *orig_res, bstring value, int field) {
+    int i;
+    tns_value_t *res;
+
+    if (orig_res == NULL)
+        return NULL;
+    res = tns_new_list();
+    for (i=0; i < darray_end(orig_res->value.list); i++) {
+        tns_value_t *row = darray_get(orig_res->value.list, i);
+        tns_value_t *field_value = darray_get(row->value.list, field);
+        if (biseq(field_value->value.string, value) == 1) {
+            darray_set(orig_res->value.list, i, NULL);
+            tns_add_to_list(res, row);
+        }
+    }
+    tns_value_destroy(orig_res);
+    return res;
+}
 
 static inline int exec_server_operations(Command *cmd,
         int (*callback)(struct ServerRun *, tns_value_t *), const char *select)
@@ -103,25 +124,30 @@ static inline int exec_server_operations(Command *cmd,
     }
 
     if(db_file != NULL) {
-        rc = DB_init(bdata(db_file));
+        rc = Config_init_db(bdata(db_file));
         check(rc == 0, "Failed to open db: %s", bdata(db_file));
+    } else {
+        rc = Config_module_load(bdata(conf_style));
+        check(rc == 0, "Failed to load config module: %s", bdata(conf_style));
 
-        if(every) {
-            res = DB_exec("SELECT %s FROM server", select);
-        } else if(name) {
-            res = DB_exec("SELECT %s FROM server where name = %Q", select, bdata(name));
-        } else if(host) {
-            res = DB_exec("SELECT %s FROM server where default_host = %Q", select, bdata(host));
-        } else if(uuid) {
-            res = DB_exec("SELECT %s FROM server where uuid = %Q", select, bdata(uuid));
-        } else {
-            sentinel("You must give either -name, -uuid, or -host to start a server.");
-        }
-
-        check(tns_get_type(res) == tns_tag_list,
-                "Wrong return type from query, should be list.");
-        check(darray_end(res->value.list) > 0, "No servers matched the description.");
+        rc =  Config_init_db(bdata(conf_url));
+        check(rc == 0, "Failed to initilize config module: %s", bdata(conf_url));
     }
+    if(every) {
+        res = CONFIG_MODULE.load_server(NULL);
+    } else if(name) {
+        res = tns_filter_str_field(CONFIG_MODULE.load_server(NULL), name, 10);
+    } else if(host) {
+        res = tns_filter_str_field(CONFIG_MODULE.load_server(NULL), host, 2);
+    } else if(uuid) {
+        res = CONFIG_MODULE.load_server(bdata(uuid));
+    } else {
+        sentinel("You must give either -name, -uuid, or -host to start a server.");
+    }
+
+    check(tns_get_type(res) == tns_tag_list,
+            "Wrong return type from query, should be list.");
+    check(darray_end(res->value.list) > 0, "No servers matched the description.");
 
     check(callback(&run, res) != -1, "Failed to run internal operation.");
 
@@ -161,8 +187,8 @@ static int run_server(struct ServerRun *r, tns_value_t *res)
     bstring uuid = NULL;
 
     if(r->db_file) {
-        DB_check(res, 0, 1, tns_tag_string);
-        tns_value_t *uuid_val = DB_get(res, 0, 0);
+        //DB_check(res, 0, 1, tns_tag_string);
+        tns_value_t *uuid_val = DB_get(res, 0, 1);
 
         config = bstrcpy(r->db_file);
         module = bfromcstr("");
@@ -216,12 +242,12 @@ static int locate_pid_file(tns_value_t *res)
 
     int cols = 0;
     int rows = DB_counts(res, &cols);
-    check(rows == 1 && cols == 2, "Wrong number of results.");
+    check(rows == 1, "Wrong number of results.");
 
-    tns_value_t *chroot = DB_get(res, 0, 0);
+    tns_value_t *chroot = DB_get(res, 0, 5);
     check(tns_get_type(chroot) == tns_tag_string, "Wrong result for server chroot, should be a string.");
 
-    tns_value_t *pid_file = DB_get(res, 0, 1);
+    tns_value_t *pid_file = DB_get(res, 0, 8);
     check(tns_get_type(pid_file) == tns_tag_string, "Wrong result for server pid_file, should be a string.");
 
     pid_path = bformat("%s%s", bdata(chroot->value.string), bdata(pid_file->value.string));
@@ -571,8 +597,8 @@ int control_server(struct ServerRun *r, tns_value_t *res)
     check(rows != -1, "Invalid data given to internal routine control_server.");
     check(rows == 1, "Ambiguous server select, expected 1 but got %d.", rows);
 
-    bstring server_name = DB_get_as(res, 0, 0, string);
-    bstring chroot = DB_get_as(res, 0, 1, string);
+    bstring server_name = DB_get_as(res, 0, 10, string);
+    bstring chroot = DB_get_as(res, 0, 5, string);
 
     check(server_name != NULL && chroot != NULL, 
             "Somehow didn't get a good server_name and chroot.");

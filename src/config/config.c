@@ -337,9 +337,9 @@ Server *Config_load_server(const char *uuid)
     tns_value_t *res = CONFIG_MODULE.load_server(uuid);
     int rc = 0;
 
-    DB_check(res, 0, 10,
+    DB_check(res, 0, 11,
             tns_tag_number, tns_tag_string, tns_tag_string, tns_tag_string, tns_tag_number,
-            tns_tag_string, tns_tag_string, tns_tag_string, tns_tag_string, tns_tag_number);
+            tns_tag_string, tns_tag_string, tns_tag_string, tns_tag_string, tns_tag_number, tns_tag_string);
 
     int server_id = DB_get_as(res, 0, 0, number); // id
 

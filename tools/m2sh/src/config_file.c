@@ -280,11 +280,11 @@ error:
     if(filter_tns) tns_value_destroy(filter_tns);
     return -1;
 }
-int Filter_load(tst_t *settings, Value *val)
+int Filter_load_m2sh(tst_t *settings, Value *val)
 {
     return Plugin_load(settings,val,&FILTER_SQL,"Filter");
 }
-int Xrequest_load(tst_t *settings, Value *val)
+int Xrequest_load_m2sh(tst_t *settings, Value *val)
 {
     return Plugin_load(settings,val,&XREQUEST_SQL,"Xrequest");
 }
@@ -381,13 +381,13 @@ int Server_load(tst_t *settings, Value *val)
     Value *filters = AST_get(settings, cls->params, &FILTERS_VAR, VAL_LIST);
 
     if(filters != NULL) {
-        AST_walk_list(settings, filters->as.list, Filter_load);
+        AST_walk_list(settings, filters->as.list, Filter_load_m2sh);
     }
 
     Value *xrequests = AST_get(settings, cls->params, &XREQUESTS_VAR, VAL_LIST);
 
     if(xrequests != NULL) {
-        AST_walk_list(settings, xrequests->as.list, Xrequest_load);
+        AST_walk_list(settings, xrequests->as.list, Xrequest_load_m2sh);
     }
 
     tns_value_destroy(res);
