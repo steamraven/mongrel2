@@ -41,11 +41,45 @@
 static mongo connexion[1];
 static bstring dbname;
 
-#define MONGODB_HOST_PORT_SEPARATOR '@'
-#define MONGODB_IP_SEPARATOR        ';'
-#define MONGODB_TOKEN_SEPARATOR     ':'
-#define MONGODB_TOKEN_SHARD         "shard"
-#define MONGODB_TOKEN_SERVER        "srv"
+#define MONGODB_HOST_PORT_SEPARATOR ':'
+#define MONGODB_LOGIN_SEPARATOR '@'
+#define MONGODB_USER_PASS_SEPARATOR ':'
+#define MONGODB_DB_SEPARATOR '?'
+#define MONGODB_OPTION_SEPARATOR '&'
+#define MONGODB_IP_SEPARATOR        ','
+#define MONGODB_TOKEN_SEPARATOR     '/'
+#define MONGODB_TOKEN_URL_SCHEME    "mongodb:"
+
+static int bpartition(bstring str, const char sep, bstring *first, bstring *rest) {
+    int i = bstrchr(str,sep);
+    if (i == BSTR_ERR) {
+        if (first)
+            *first = bstrcpy(str);
+        if (rest)
+            *rest = NULL;
+        return 0;
+    }
+    if (first)
+        *first = bmidstr(str,0, i);
+    if (rest)
+        *rest = bmidstr(str, i+1, blength(str));
+    return 0;
+}
+static int brpartition(bstring str, const char sep, bstring *rest, bstring *last) {
+    int i = bstrrchr(str,sep);
+    if (i == BSTR_ERR) {
+        if (last)        
+            *last = bstrcpy(str);
+        if (rest)
+            *rest = NULL;
+        return 0;
+    }
+    if (rest)
+        *rest = bmidstr(str,0, i);
+    if (last)    
+        *last = bmidstr(str, i+1, blength(str));
+    return 0;
+}
 
 static int config_init_index(void)
 {
@@ -97,160 +131,172 @@ static int config_init_index(void)
     return 0;
 }
 
-static int config_init_server(struct bstrList *tokens)
+static int config_init_server(bstring ip, bstring options)
 {
     int ret = -1;
     int status, port = MONGO_DEFAULT_PORT;
-    char *ip = NULL, *sport = NULL;
-    struct bstrList *host = NULL;
-    struct bstrList *ips = NULL;
+    bstring host = NULL, sport = NULL;
 
-    dbname = bstrcpy(tokens->entry[2]);
-    check (dbname->mlen > 0, "Database name can't be empty");
+    status = bpartition(ip, MONGODB_HOST_PORT_SEPARATOR, &host, &sport);
+    check (status == 0, "Error on bsplit"); 
 
-    ips = bsplit(tokens->entry[1], MONGODB_IP_SEPARATOR);
-    check (ips->qty == 1, "In server connection mode, you must provide only one host."); 
+    if (sport != NULL)
+        port = atoi(bdata(sport));
 
-    host = bsplit(ips->entry[0], MONGODB_HOST_PORT_SEPARATOR);
-    check (host != NULL, "Error on bsplit"); 
-
-    switch (host->qty) {
-        case 2:
-            sport = bstr2cstr (host->entry[1], '\0');
-            check (sport != NULL, "Error on bstr2cstr");
-            port = atoi(sport);
-
-        case 1:
-            ip = bstr2cstr (host->entry[0], '\0');
-            check (ip != NULL, "Error on bstr2cstr");
-            break;           
-
-        default:
-            sentinel("Something is cooking.");
-    }
-
-    log_info ("Connecting to server %s:%d", ip, port);
-    status = mongo_connect(connexion, ip, port);
+    log_info ("Connecting to server %s:%d", bdata(host),port);
+    status = mongo_connect(connexion, bdata(host), port);
     check(status == MONGO_OK, "Connection fail to mongoDB configuration server.");
 
     ret = 0;
 
 error:
-    bstrListDestroy(host);
-    bstrListDestroy(ips);
-    bcstrfree(ip);
-    bcstrfree(sport);
+    bdestroy(host);
+    bdestroy(sport);
     return ret;
 }
 
-static int config_init_shard(struct bstrList *tokens)
+static int config_init_replicaset(bstring ip_string, bstring options)
 {
     int ret = -1;
     int i, status, port;
-    bstring shardname;
-    char *shard = NULL;
-    char *ip = NULL, *sport = NULL;
-    struct bstrList *host = NULL;
+    bstring replicaset = NULL;
+    bstring host = NULL, sport = NULL;;
     struct bstrList *ips = NULL;
+    const char option_name[] = "replicaset=";
 
-    shardname = tokens->entry[1];
-    check(shardname->slen > 0, "Shard name can't be empty");
+    //find replica set name:
+    i = binstrcaseless(options, 0, bfromcstr(option_name));
+    check(i!= BSTR_ERR, "Must provide relicaset option");
+    status = bassignmidstr(options, options, i+sizeof(option_name), blength(options));
+    check(status ==0, "Error getting replicaset");
+    status = bpartition(options, MONGODB_OPTION_SEPARATOR, &replicaset, NULL);
+    check (status == 0, "Error getting replicaset");
 
-    dbname = bstrcpy(tokens->entry[3]);
-    check (dbname->mlen > 0, "Database name can't be empty");
+    mongo_replset_init(connexion, bdata(replicaset));
+    log_info("Connecting to replicaset \"%s\"", bdata(replicaset));
 
-    ips = bsplit(tokens->entry[2], MONGODB_IP_SEPARATOR);
-    check (ips->qty > 1, "In server connection mode, you must provide only one host."); 
+    // parse ips
+    ips = bsplit(ip_string, MONGODB_IP_SEPARATOR);
 
-    host = bsplit(ips->entry[0], ':');
-    check (host != NULL, "Error on bsplit"); 
-
-    shard = bstr2cstr (shardname, '\0');
-    check (shard != NULL, "Error on bstr2cstr");
-    mongo_replset_init(connexion, shard);
-    log_info("Connecting to shard \"%s\"", shard);
-    
     i = ips->qty;
     while(--i >= 0) {
+        //TODO?: use bpartition
         port = MONGO_DEFAULT_PORT;
-        host = bsplit(ips->entry[i], MONGODB_HOST_PORT_SEPARATOR);
-        check (host != NULL, "Error on bsplit"); 
+        status = bpartition(ips->entry[i], MONGODB_HOST_PORT_SEPARATOR, &host, &sport);
+        check (status == 0, "Error on bsplit"); 
 
-        switch (host->qty) {
-            case 2:
-                sport = bstr2cstr (host->entry[1], '\0');
-                check (sport != NULL, "Error on bstr2cstr");
-                port = atoi(sport);
+        if (sport != NULL)
+            port = atoi(bdata(sport));
 
-            case 1:
-                ip = bstr2cstr (host->entry[0], '\0');
-                check (ip != NULL, "Error on bstr2cstr");
-                break;           
-
-            default:
-                sentinel("Something is cooking.");
-        }
-        mongo_replset_add_seed(connexion, ip, port);
-        log_info("Add seed %s:%d", ip, port);
-        bcstrfree(ip), ip = NULL;
-        bcstrfree(sport), sport = NULL;
+        mongo_replset_add_seed(connexion,bdata(host), port);
+        log_info("Add seed %s:%d", bdata( host), port);
+        bdestroy(host), host = NULL;
+        bdestroy(sport), sport = NULL;
     }
 
     status = mongo_replset_connect(connexion);
-    check(status == MONGO_OK, "Connection fail to mongoDB configuration shard.");
+    check(status == MONGO_OK, "Connection fail to mongoDB configuration replicaset.");
 
     ret = 0;
 
 error:
-    bstrListDestroy(host);
     bstrListDestroy(ips);
-    bcstrfree(shard);
-    bcstrfree(ip);
-    bcstrfree(sport);
+    bdestroy(replicaset);
+    bdestroy(host);
+    bdestroy(sport);
     return ret;
 }
 
 /*
  *  Init the config system from a path string.
- *  Some example of mongodb description to server or shard cluster:
- *      server:localhost:mongrel2_collection
- *      server:localhost@27017:mongrel2
- *      shard:shardName:srv1;srv2:mongrel2
- *      shard:shardName:srv1@27017;srv2@27018:mongrel2
- *      shard:shardName:srv1;srv2;srv3;srv4:m2
+ *  Some example of mongodb description to server or replica set:
+ 
+        mongodb://localhost/mongrel2_collection
+        mongodb://localhost:27017/mongrel2
+        mongodb://user:pass@localhost:27017/mongrel2
+
+        mongodb://srv1:27017,srv2:27018/mongrel2?relicaSet=test
+        mongodb://srv1,srv2,srv3,srv4/m2?replicaSet=web
+        mongodb://user:pass@srv1,srv2/m2?replicaSet=web
  */
+
+
 int config_init(const char *path)
 {
     int status, ret = -1;
     struct bstrList *tokens = NULL;
+    struct bstrList *work = NULL;
+    bstring dbspec = NULL;
+    bstring login = NULL;
+    bstring user = NULL;
+    bstring pass = NULL;
+    bstring ips = NULL;
+    bstring options = NULL;
 
     log_info("Init mongoDB configuration module");
 
-    bstring dbspec = bfromcstr(path);
+    dbspec = bfromcstr(path);
     check(dbspec != NULL, "Can't read path.");
 
     tokens = bsplit(dbspec, MONGODB_TOKEN_SEPARATOR);
     check(tokens != NULL, "Can't split the path.");
+    check(tokens->qty == 3 || tokens->qty == 4,"Invalid database specification format.");
 
-    if (biseqcstr(tokens->entry[0], MONGODB_TOKEN_SERVER) == 1) {
-        check(tokens->qty == 3, "Invalid database specification format.");
-        ret = config_init_server(tokens);
-    } else if (biseqcstr(tokens->entry[0], MONGODB_TOKEN_SHARD) == 1) {
-        check(tokens->qty == 4, "Invalid database specification format.");
-        ret = config_init_shard(tokens);
+    check(biseqcstr(tokens->entry[0], MONGODB_TOKEN_URL_SCHEME) == 1, "Invalid url scheme");
+    check(blength(tokens->entry[1]) == 0, "Invalid url format");
+
+    // check for login info
+    check(brpartition(tokens->entry[2], MONGODB_LOGIN_SEPARATOR, &login, &ips) == 0, "Can't extract login");
+
+    // find user/pass
+    if (login) {
+        check(bpartition(login, MONGODB_USER_PASS_SEPARATOR, &user,&pass) == 0, "Can't extract user/pass");
+    }
+
+    //find dbname/options
+    if (tokens->qty == 3) {
+        // no dbname or options
+        dbname = blk2bstr (bsStaticBlkParms ("admin"));
+        
     } else {
-        sentinel("Unknown connection type.");
+        //dbname
+        check(bpartition(tokens->entry[3], MONGODB_DB_SEPARATOR, &dbname, &options) == 0, "Can't extract dbname");
+        if (blength(dbname) == 0) {
+            bassignblk(dbname, bsStaticBlkParms("admin"));
+        }
+    }
+
+    if (bstrchr(ips, MONGODB_IP_SEPARATOR) != BSTR_ERR) {
+        ret = config_init_replicaset(ips, options);
+    } else {
+        ret = config_init_server(ips, options);
     }
     check(ret == 0, "Error during connection.");
+
+    if (login) {
+        log_info("Logging into database %s with user %s", bdata(dbname), bdata(user));
+        status  = mongo_cmd_authenticate( connexion, bdata(dbname), bdata(user), bdata(pass));
+        if (status != MONGO_OK) {
+            mongo_destroy(connexion);
+            ret = -1;
+            sentinal("Error authenticating: %d", status);
+        }
+    }
 
     status = bconchar(dbname, '.');
     check (status != BSTR_ERR, "Error on bconchar");
 
-    ret = config_init_index();    
-    check(ret == 0, "Error during setup index.");
+    //ret = config_init_index();    
+    //check(ret == 0, "Error during setup index.");
 
 error:
     bdestroy(dbspec);
+    bdestroy(login);
+    bdestroy(user);
+    bdestroy(pass);
+    bdestroy(ips);
+    bdestroy(options);
+
     bstrListDestroy(tokens);
     return ret;
 }

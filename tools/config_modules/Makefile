@@ -11,7 +11,7 @@ MONGO_SRC = mongo-c-driver/src/bson.c \
             mongo-c-driver/src/env_posix.c
 MONGO_CFLAGS = -fPIC -Imongo-c-driver/src -DMONGO_HAVE_STDINT
 
-all: null.so zmq.so
+all: null.so zmq.so mongodb.so
 
 .PHONY: fetch_mongo_c_driver
 fetch_mongo_c_driver:
