@@ -32,6 +32,6 @@ int Host_load(tst_t *settings, struct Value *val);
 
 int Server_load(tst_t *settings, struct Value *val);
 
-int Config_load(const char *config_file, const char *db_file);
+int Config_load(const char *config_file, const char *config_module, const char *db_file);
 
 #endif

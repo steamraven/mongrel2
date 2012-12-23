@@ -209,6 +209,18 @@ error:
     if(res) tns_value_destroy(res);
     return NULL;
 }
+int DB_exec2(const char *query) {
+    int rc = 0;
+    char *zErrMsg = NULL;
+    check(CONFIG_DB != NULL, "The config database is not open.");
+    rc = sqlite3_exec(CONFIG_DB, query, NULL, NULL, &zErrMsg);
+    check(rc == SQLITE_OK, "Failed to execute query: %s", zErrMsg);    
+    return 0;
+error:
+    if(zErrMsg) sqlite3_free(zErrMsg);
+    return -1;
+}
+
 
 /**
  * Gets the tns_value_t at this result's row/col point,

@@ -516,6 +516,7 @@ tns_value_t *config_load_routes(int host_id, int server_id)
     bson_init(fields);
     bson_append_int(fields, "id", 1);
     bson_append_int(fields, "path", 1);
+    bson_append_int(fields, "host_id", 1);
     bson_append_int(fields, "target_id", 1);
     bson_append_int(fields, "target_type", 1);
     bson_finish(fields);

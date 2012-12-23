@@ -189,13 +189,14 @@ int Config_load_routes(Server *srv, Host *host, int host_id, int server_id)
     }
 
     for(row_i = 0; row_i < rows; row_i++) {
-        DB_check(res, row_i, 4, 
-            tns_tag_number, tns_tag_string, tns_tag_number, tns_tag_string);
+        DB_check(res, row_i, 5, 
+            tns_tag_number, tns_tag_string, tns_tag_number, tns_tag_number, tns_tag_string);
  
         int route_id = DB_get_as(res, row_i, 0, number);
         bstring path = DB_get_as(res, row_i, 1, string);
-        int id = DB_get_as(res, row_i, 2, number);
-        bstring type = DB_get_as(res, row_i, 3, string);
+        // host_id ignored
+        int id = DB_get_as(res, row_i, 3, number);
+        bstring type = DB_get_as(res, row_i, 4, string);
         void *target = NULL;
         BackendType backend_type = 0;
 

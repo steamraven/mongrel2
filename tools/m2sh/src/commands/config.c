@@ -39,13 +39,23 @@
 
 int Command_load(Command *cmd)
 {
-    bstring db_file = option(cmd, "db", "config.sqlite");
+    bstring db_file = option(cmd, "db", NULL);
     bstring conf_file = option(cmd, "config", "mongrel2.conf");
+    bstring conf_module = option(cmd, "style", NULL);
+    bstring conf_url = options(cmd, "url", NULL);
     bstring what = NULL;
     bstring why = NULL;
 
+    if(conf_url == NULL && db_file == NULL) {
+        db_file = bfromcstr("config.sqlite");
+    }
+
+    if (db_file == NULL) {
+        db_file = conf_url;
+    }
+
     check_file(conf_file, "config file", R_OK);
-    Config_load(bdata(conf_file), bdata(db_file));
+    Config_load(bdata(conf_file), bdata(conf_module), bdata(db_file));
 
     what = bfromcstr("load");
     why = bfromcstr("command");
